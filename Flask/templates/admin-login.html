@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Admin Login</title>
+  <link href="/static/css/bootstrap.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/4.7.0/css/font-awesome.min.css">
+  <style>
+    body {
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    }
+    .admin-login-container {
+      background: white;
+      border-radius: 10px;
+      box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+      width: 100%;
+      max-width: 400px;
+      padding: 40px;
+    }
+    .admin-header {
+      text-align: center;
+      margin-bottom: 30px;
+    }
+    .admin-header i {
+      font-size: 48px;
+      color: #667eea;
+      margin-bottom: 10px;
+    }
+    .admin-header h1 {
+      font-size: 28px;
+      color: #333;
+      margin: 0;
+    }
+    .form-group {
+      margin-bottom: 20px;
+    }
+    .form-group label {
+      color: #333;
+      font-weight: 600;
+      margin-bottom: 8px;
+      display: block;
+    }
+    .form-group input {
+      width: 100%;
+      padding: 12px;
+      border: 1px solid #ddd;
+      border-radius: 5px;
+      font-size: 14px;
+      transition: border-color 0.3s;
+    }
+    .form-group input:focus {
+      outline: none;
+      border-color: #667eea;
+      box-shadow: 0 0 5px rgba(102, 126, 234, 0.5);
+    }
+    .login-btn {
+      width: 100%;
+      padding: 12px;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: white;
+      border: none;
+      border-radius: 5px;
+      font-size: 16px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: transform 0.3s;
+    }
+    .login-btn:hover {
+      transform: translateY(-2px);
+    }
+    .login-btn:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+    .error-message {
+      background: #fee2e2;
+      color: #991b1b;
+      padding: 12px;
+      border-radius: 5px;
+      margin-bottom: 20px;
+      display: none;
+    }
+    .success-message {
+      background: #dcfce7;
+      color: #166534;
+      padding: 12px;
+      border-radius: 5px;
+      margin-bottom: 20px;
+      display: none;
+    }
+  </style>
+</head>
+<body>
+  <div class="admin-login-container">
+    <div class="admin-header">
+      <i class="fa fa-shield"></i>
+      <h1>Admin Login</h1>
+    </div>
+
+    <div id="errorMessage" class="error-message"></div>
+    <div id="successMessage" class="success-message"></div>
+
+    <form id="adminLoginForm">
+      <div class="form-group">
+        <label for="username"><i class="fa fa-user"></i> Username</label>
+        <input type="text" id="username" name="username" placeholder="Enter username" required>
+      </div>
+
+      <div class="form-group">
+        <label for="password"><i class="fa fa-lock"></i> Password</label>
+        <input type="password" id="password" name="password" placeholder="Enter password" required>
+      </div>
+
+      <button type="submit" class="login-btn">
+        <i class="fa fa-sign-in"></i> Login
+      </button>
+    </form>
+
+    <div style="text-align: center; margin-top: 20px; color: #999; font-size: 12px;">
+      <p>Default credentials:<br>Username: <strong>admin</strong><br>Password: <strong>1234</strong></p>
+    </div>
+  </div>
+
+  <script>
+    document.getElementById('adminLoginForm').addEventListener('submit', async function(e) {
+      e.preventDefault();
+
+      const username = document.getElementById('username').value.trim();
+      const password = document.getElementById('password').value;
+      const button = this.querySelector('button');
+      const errorMsg = document.getElementById('errorMessage');
+      const successMsg = document.getElementById('successMessage');
+
+      // Hide messages
+      errorMsg.style.display = 'none';
+      successMsg.style.display = 'none';
+
+      if (!username || !password) {
+        errorMsg.textContent = 'Please enter both username and password';
+        errorMsg.style.display = 'block';
+        return;
+      }
+
+      button.disabled = true;
+      button.innerHTML = '<i class="fa fa-spinner fa-spin"></i> Logging in...';
+
+      try {
+        const formData = new FormData();
+        formData.append('username', username);
+        formData.append('password', password);
+
+        const response = await fetch('/admin-login.html', {
+          method: 'POST',
+          body: formData
+        });
+
+        const data = await response.json();
+
+        if (data.success) {
+          successMsg.textContent = 'Login successful! Redirecting...';
+          successMsg.style.display = 'block';
+          setTimeout(() => {
+            window.location.href = data.redirect || '/admin-dashboard.html';
+          }, 1000);
+        } else {
+          errorMsg.textContent = data.message || 'Login failed';
+          errorMsg.style.display = 'block';
+          button.disabled = false;
+          button.innerHTML = '<i class="fa fa-sign-in"></i> Login';
+        }
+      } catch (error) {
+        console.error('Error:', error);
+        errorMsg.textContent = 'An error occurred. Please try again.';
+        errorMsg.style.display = 'block';
+        button.disabled = false;
+        button.innerHTML = '<i class="fa fa-sign-in"></i> Login';
+      }
+    });
+  </script>
+</body>
+</html>

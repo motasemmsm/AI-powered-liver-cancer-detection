@@ -1,7 +1,15 @@
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'       # suppress TF C++ info/warning/error logs
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'      # suppress oneDNN custom ops warning
+
 import tensorflow as tf
+tf.get_logger().setLevel('ERROR')              # suppress Python-level TF warnings
+
+import logging
+logging.getLogger('absl').setLevel(logging.ERROR)  # suppress absl warnings
+
 import numpy as np
 from PIL import Image
-import os
 from io import BytesIO
 
 # Model paths
@@ -25,19 +33,12 @@ def load_models():
     for model_name, model_path in MODEL_PATHS.items():
         try:
             if os.path.exists(model_path):
-                try:
-                    models[model_name] = tf.keras.models.load_model(model_path)
-                    print(f"[OK] Loaded {model_name} model")
-                except Exception as first_error:
-                    print(f"[WARN] Standard load failed for {model_name}: {str(first_error)[:100]}")
-                    print(f"[WARN] Trying with compile=False")
-                    models[model_name] = tf.keras.models.load_model(model_path, compile=False)
-                    print(f"[OK] Loaded {model_name} model (with compile=False)")
+                models[model_name] = tf.keras.models.load_model(model_path, compile=False)
+                print(f"[OK] Loaded {model_name} model")
             else:
                 print(f"[ERROR] Model not found: {model_path}")
         except Exception as e:
-            error_msg = str(e)[:150]
-            print(f"[ERROR] {model_name}: {error_msg}")
+            print(f"[ERROR] {model_name}: {str(e)[:150]}")
 
 def prepare_image(image_input, target_size=(224, 224), grayscale=False):
     try:

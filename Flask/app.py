@@ -546,6 +546,7 @@ def home():
 def news():
     return flask.render_template("news.html", title="News Page")
 
+
 @app.route('/contact-us.html')
 def contact_us():
     return flask.render_template('contact-us.html', title="Contact-us Page")
