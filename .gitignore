@@ -14,6 +14,10 @@ env/
 # Firebase credentials
 serviceAccountKey.json
 
+# IDE
+.vscode/
+pyrightconfig.json
+
 # ML Models
 Flask/Models/
 *.h5
