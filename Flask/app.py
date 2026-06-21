@@ -25,6 +25,8 @@ from openai import OpenAI
 from dotenv import load_dotenv
 from model_predictor import load_models, get_full_prediction
 from flask_talisman import Talisman
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 from PIL import Image, ImageFilter, ImageStat
 
 # Load .env file from the Flask app directory
@@ -55,6 +57,15 @@ Talisman(app,
 # Fix for proxy headers
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1) # proxy fix makes flask see that data that disappeared by proxy
 
+# Rate limiting — memory storage, safe for single-worker dev/prod deployments
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=["500 per day", "100 per hour"],
+    storage_uri="memory://",
+    headers_enabled=True,
+)
+
 #########################==================== LOGGING SETUP ====================#########################
 # save all actions in file called app.log
 logging.basicConfig(
@@ -84,6 +95,9 @@ cache_timeout = 300  # 5 minutes
 
 # DEMO MODE: Store demo predictions in memory
 demo_predictions = {}  # {email: [predictions]}
+
+# Rate-limit breach tracker: IP -> datetime when the 5-min block expires
+_ip_blocks = {}
 
 #########################==================== AI MODEL INITIALIZATION ====================#########################
 print("Loading AI models...")
@@ -733,6 +747,25 @@ def check_verification_code(email, code):
         return False, 'Incorrect code'
     return True, 'OK'
 
+def _block_ip(ip, minutes=5):
+    _ip_blocks[ip] = datetime.now() + timedelta(minutes=minutes)
+
+def _is_ip_blocked(ip):
+    expiry = _ip_blocks.get(ip)
+    if not expiry:
+        return False, 0
+    if datetime.now() < expiry:
+        return True, int((expiry - datetime.now()).total_seconds())
+    del _ip_blocks[ip]
+    return False, 0
+
+@app.before_request
+def check_ip_block():
+    ip = get_remote_address()
+    blocked, remaining = _is_ip_blocked(ip)
+    if blocked:
+        return flask.jsonify({'error': f'Too many requests. Please try again in {remaining} seconds.'}), 429
+
 ##########################==================== CONTEXT PROCESSORS ====================#########################
 
 @app.context_processor
@@ -846,6 +879,7 @@ def admin_dashboard():
 #########################==================== AUTHENTICATION ROUTES ====================#########################
 
 @app.route('/login.html', methods=['GET', 'POST'])
+@limiter.limit("10 per minute", methods=["POST"])
 def login():
     if flask.request.method == 'POST':
         email = sanitize_input(flask.request.form.get('email', '').strip())
@@ -926,6 +960,7 @@ def login():
     return flask.render_template('login.html', title='Login Page')
 
 @app.route('/register.html', methods=['GET', 'POST'])
+@limiter.limit("5 per minute", methods=["POST"])
 def register():
     if flask.request.method == 'POST':
         try:
@@ -1036,6 +1071,7 @@ def forgot_password_page():
     return flask.render_template('forgot-password.html', title='Forgot Password')
 
 @app.route('/api/send-reset-code', methods=['POST'])
+@limiter.limit("5 per minute")
 def send_reset_code():
     """Step 1 – send a 6-digit reset code to the email address"""
     data  = flask.request.get_json(silent=True) or {}
@@ -1061,6 +1097,7 @@ def send_reset_code():
     }), 200
 
 @app.route('/api/verify-reset-code', methods=['POST'])
+@limiter.limit("10 per minute")
 def verify_reset_code():
     """Step 2 – verify the code; mark it as confirmed"""
     data  = flask.request.get_json(silent=True) or {}
@@ -1079,6 +1116,7 @@ def verify_reset_code():
     return flask.jsonify({'success': True}), 200
 
 @app.route('/api/reset-password', methods=['POST'])
+@limiter.limit("5 per minute")
 def reset_password():
     """Step 3 – save the new password after code has been verified"""
     data         = flask.request.get_json(silent=True) or {}
@@ -1131,6 +1169,7 @@ def verify_email_page():
     return flask.render_template('verify-email.html', title='Verify Email')
 
 @app.route('/api/resend-verification', methods=['POST'])
+@limiter.limit("5 per minute")
 def resend_verification():
     """Resend the registration verification code"""
     data  = flask.request.get_json(silent=True) or {}
@@ -1151,6 +1190,7 @@ def resend_verification():
     return flask.jsonify({'success': True, 'message': 'Code resent'}), 200
 
 @app.route('/api/verify-registration', methods=['POST'])
+@limiter.limit("10 per minute")
 def verify_registration():
     """Complete registration after email code is verified"""
     data  = flask.request.get_json(silent=True) or {}
@@ -1329,6 +1369,7 @@ def get_doctor_info():
         return flask.jsonify({'success': False, 'message': str(e)}), 500
 
 @app.route('/api/chat', methods=['POST'])
+@limiter.limit("30 per minute")
 def chat():
     try:
         data = flask.request.json
@@ -1374,6 +1415,7 @@ def chat():
 
 @app.route('/api/predict', methods=['POST'])
 @login_required
+@limiter.limit("10 per minute")
 def predict():
     # Check if admin is trying to upload
     if flask.session.get('admin_logged_in') or flask.session.get('is_admin'):
@@ -1892,7 +1934,9 @@ def too_large(error):
 
 @app.errorhandler(429)
 def rate_limit_handler(error):
-    return flask.jsonify({'error': 'Too many requests. Please try again later.'}), 429
+    ip = get_remote_address()
+    _block_ip(ip, minutes=5)
+    return flask.jsonify({'error': 'Too many requests. Please try again in 5 minutes.'}), 429
 
 ########################==================== MAIN ====================########################
 if __name__ == '__main__':
