@@ -9,6 +9,9 @@ import random
 import threading
 import smtplib
 import secrets
+import base64
+import io
+import json
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from functools import wraps
@@ -22,6 +25,7 @@ from openai import OpenAI
 from dotenv import load_dotenv
 from model_predictor import load_models, get_full_prediction
 from flask_talisman import Talisman
+from PIL import Image, ImageFilter, ImageStat
 
 # Load .env file from the Flask app directory
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -35,7 +39,7 @@ app = flask.Flask(__name__)
 app.secret_key = os.getenv('SECRET_KEY', os.urandom(32).hex())
 app.config['SESSION_COOKIE_SECURE'] = os.getenv('SESSION_COOKIE_SECURE', 'False').lower() == 'true'
 app.config['SESSION_COOKIE_HTTPONLY'] = True
-app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax' # to make the website make requests normally but block requests from other websites "strict" , "None"
 app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(hours=24)
 app.config['MAX_CONTENT_LENGTH'] = 5 * 1024 * 1024  # 5MB max file size
 app.config['UPLOAD_FOLDER'] = '/tmp'  # Use temp folder for uploads
@@ -49,14 +53,15 @@ Talisman(app,
          force_https_permanent=False) 
 
 # Fix for proxy headers
-app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1) # proxy fix makes flask see that data that disappeared by proxy
 
 #########################==================== LOGGING SETUP ====================#########################
+# save all actions in file called app.log
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        # logging.FileHandler('app.log'),
+        logging.FileHandler('app.log'),
         logging.StreamHandler()
     ]
 )
@@ -131,8 +136,7 @@ SMTP_HOST     = os.getenv('SMTP_HOST', 'smtp.gmail.com')
 SMTP_PORT     = int(os.getenv('SMTP_PORT', '587'))
 SMTP_USER     = os.getenv('SMTP_USER', '')
 SMTP_PASSWORD = os.getenv('SMTP_PASSWORD', '')
-
-SMTP_FROM = os.getenv('SMTP_FROM', 'Liver Care <noreply@livercare.com>')
+SMTP_FROM     = os.getenv('SMTP_FROM', 'Liver Care <noreply@livercare.com>')
 
 # In-memory stores  {email: {code, expires_at, type}}
 verification_codes    = {}   # for both reset & registration verification
@@ -320,6 +324,209 @@ def save_chat_log(question, answer, status='success', model_name='moonshotai/Kim
         logger.warning(f"Firebase quota exceeded - chat log not saved: {question[:50]}")
     except Exception as e:
         logger.error(f"Failed to save chat log: {e}")
+
+def _extract_json_object(text):
+    """Extract the first JSON object from a model response."""
+    if not text:
+        return None
+
+    cleaned = text.strip()
+    cleaned = re.sub(r'^```(?:json)?\s*', '', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'\s*```$', '', cleaned)
+
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        match = re.search(r'\{.*\}', cleaned, flags=re.DOTALL)
+        if not match:
+            return None
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            return None
+
+
+def _local_liver_scan_precheck(image_data):
+    """
+    Reject obvious non-medical uploads before asking the AI model.
+    Returns (passed, reason, confidence).
+    """
+    file_size = len(image_data)
+    if file_size < 5000:
+        return False, 'Image file is too small to analyze. Please upload a clear liver CT, MRI, or ultrasound scan.', 0.98
+
+    try:
+        image = Image.open(io.BytesIO(image_data))
+        image.verify()
+        image = Image.open(io.BytesIO(image_data)).convert('RGB')
+    except Exception:
+        return False, 'Uploaded file is not a valid image.', 1.0
+
+    width, height = image.size
+    if width < 128 or height < 128:
+        return False, 'Image resolution is too small for medical scan analysis.', 0.95
+
+    gray = image.convert('L')
+    rgb_stat = ImageStat.Stat(image)
+    pixels = width * height
+    histogram = gray.histogram()
+    white_ratio = sum(histogram[235:]) / pixels
+    dark_ratio = sum(histogram[:35]) / pixels
+    unique_gray_levels = sum(1 for count in histogram if count)
+    grayscale_channel_spread = max(rgb_stat.mean) - min(rgb_stat.mean)
+    center = gray.crop((width // 4, height // 4, width * 3 // 4, height * 3 // 4))
+    center_stddev = ImageStat.Stat(center).stddev[0]
+    edges = gray.filter(ImageFilter.FIND_EDGES)
+    edge_histogram = edges.histogram()
+    edge_ratio = sum(edge_histogram[80:]) / pixels
+
+    logger.info(
+        "Image precheck: size=%s bytes dimensions=%sx%s white_ratio=%.3f "
+        "dark_ratio=%.3f unique_gray=%s channel_spread=%.2f center_stddev=%.2f edge_ratio=%.3f",
+        file_size, width, height, white_ratio, dark_ratio, unique_gray_levels,
+        grayscale_channel_spread, center_stddev, edge_ratio
+    )
+
+    if white_ratio > 0.35 and dark_ratio < 0.20:
+        return False, 'Image looks like a document, diagram, or screenshot instead of a medical scan.', 0.96
+
+    if unique_gray_levels < 45 and edge_ratio > 0.015:
+        return False, 'Image has diagram-like flat colors and line art, not scan texture.', 0.93
+
+    if center_stddev < 12 and dark_ratio < 0.25:
+        return False, 'Image does not contain enough scan-like anatomy detail.', 0.88
+
+    if dark_ratio < 0.10 and white_ratio < 0.10 and center_stddev < 30 and edge_ratio > 0.02:
+        return False, 'Image looks like an app screenshot or interface, not a medical scan.', 0.92
+
+    if grayscale_channel_spread > 35 and dark_ratio < 0.35:
+        return False, 'Image appears to be a regular color image rather than a CT/MRI/ultrasound scan.', 0.84
+
+    return True, 'Image passed local medical-scan precheck.', 0.65
+
+
+def _uploaded_image_mime(image_data):
+    try:
+        image = Image.open(io.BytesIO(image_data))
+        image_format = (image.format or '').lower()
+    except Exception:
+        return 'image/jpeg'
+
+    if image_format == 'png':
+        return 'image/png'
+    if image_format in ('jpg', 'jpeg'):
+        return 'image/jpeg'
+    if image_format == 'webp':
+        return 'image/webp'
+    return 'image/jpeg'
+
+
+def validate_liver_image_with_kimi(image_data):
+    """
+    Validate that the upload is a liver CT/MRI/ultrasound image before prediction.
+    Returns: {'is_liver': True/False, 'confidence': float, 'reason': str}
+    """
+    try:
+        logger.info(f"Validating uploaded image before prediction: size={len(image_data)} bytes")
+
+        precheck_passed, precheck_reason, precheck_confidence = _local_liver_scan_precheck(image_data)
+        if not precheck_passed:
+            logger.warning(f"Image rejected by local precheck: {precheck_reason}")
+            return {
+                'is_liver': False,
+                'confidence': precheck_confidence,
+                'reason': precheck_reason
+            }
+
+        image_b64 = base64.b64encode(image_data).decode('utf-8')
+        image_mime = _uploaded_image_mime(image_data)
+        if not hf_token_configured or client is None:
+            logger.warning("HF_TOKEN is not configured; image validation cannot call Hugging Face")
+            return {
+                'is_liver': False,
+                'confidence': 0.0,
+                'reason': 'Image validation is not configured. Please add a valid Hugging Face token before prediction.'
+            }
+
+        validation_model = os.getenv('IMAGE_VALIDATION_MODEL', 'Qwen/Qwen3-VL-8B-Instruct')
+
+        prompt = (
+            "You are validating uploads for a liver cancer detection app. "
+            "Look at the image and decide if it is a medical CT, MRI, or ultrasound scan "
+            "that shows the liver or upper abdomen. Reject class diagrams, documents, charts, "
+            "screenshots, logos, drawings, non-medical photos, and scans of other body parts. "
+            "Return only JSON with keys: is_liver (boolean), confidence (0 to 1), reason (short string)."
+        )
+
+        completion = client.chat.completions.create(
+            model=validation_model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{image_mime};base64,{image_b64}"
+                            }
+                        }
+                    ]
+                }
+            ],
+            max_tokens=120,
+            temperature=0,
+            timeout=30
+        )
+
+        raw_response = completion.choices[0].message.content
+        parsed = _extract_json_object(raw_response)
+        if not parsed:
+            logger.warning(f"Image validation model returned non-JSON response: {raw_response}")
+            return {
+                'is_liver': False,
+                'confidence': 0.0,
+                'reason': 'Could not confirm this is a liver medical image.'
+            }
+
+        is_liver = bool(parsed.get('is_liver', False))
+        confidence = float(parsed.get('confidence', 0.0) or 0.0)
+        reason = str(parsed.get('reason', 'No validation reason provided.'))[:300]
+
+        logger.info(
+            f"Image validation result provider=huggingface, model={validation_model}, "
+            f"is_liver={is_liver}, confidence={confidence}, reason={reason}"
+        )
+        return {
+            'is_liver': is_liver and confidence >= 0.55,
+            'confidence': confidence,
+            'reason': reason
+        }
+
+    except Exception as e:
+        logger.error(f"Image validation error: {e}")
+        error_text = str(e).lower()
+        if (
+            'vision not support' in error_text
+            or 'invalid_request_body' in error_text
+            or 'image_url' in error_text
+            or '400' in error_text
+        ):
+            logger.warning(
+                "Image validation model could not inspect images. Configure IMAGE_VALIDATION_MODEL "
+                "with a vision-capable model to enable AI image validation."
+            )
+            return {
+                'is_liver': False,
+                'confidence': 0.0,
+                'reason': 'Image validation model is not available. Please configure a supported vision model before prediction.'
+            }
+
+        return {
+            'is_liver': False,
+            'confidence': 0.0,
+            'reason': 'Could not validate this image. Please upload a clear liver CT, MRI, or ultrasound scan.'
+        }
 
 def login_required(f):
     """Decorator to require user login"""
@@ -546,7 +753,6 @@ def home():
 @app.route("/news.html")
 def news():
     return flask.render_template("news.html", title="News Page")
-
 
 @app.route('/contact-us.html')
 def contact_us():
@@ -1192,9 +1398,24 @@ def predict():
             return flask.jsonify({'success': False, 'message': 'File too large (max 5MB)'}), 400
         
         file.seek(0)
+        
+        user_email = flask.session.get('user_email')
+        
+        # Validate if image is a liver image using Kimi K2
+        liver_validation = validate_liver_image_with_kimi(image_data)
+        if not liver_validation.get('is_liver', False):
+            logger.warning(f"Non-liver image rejected for user {user_email}: {liver_validation.get('reason')}")
+            return flask.jsonify({
+                'success': False,
+                'message': liver_validation.get(
+                    'reason',
+                    'This is not a liver medical image. Please upload a CT, MRI, or ultrasound scan of the liver.'
+                )
+            }), 400
+        
         image_hash = hashlib.md5(image_data).hexdigest()
 
-        user_email = flask.session.get('user_email')
+        # user_email already defined above
 
         # DEMO MODE: Return sample prediction without Firebase
         if DEMO_MODE and user_email == DEMO_EMAIL:
